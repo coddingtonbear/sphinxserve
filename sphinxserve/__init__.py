@@ -6,6 +6,8 @@ usage: sphinxserve [-h] {serve,install,uninstall} ...'''
 
 __version__ = '0.7.4'
 __author__ = 'Daniel Mizyrycki'
+import subprocess
+import tempfile
 
 import gevent.monkey
 gevent.monkey.patch_all()
@@ -13,14 +15,16 @@ gevent.monkey.patch_all()
 from gevent.event import Event
 from gevent import spawn, joinall
 from loadconfig import Config
-from loadconfig.lib import capture_stream, write_file
-import logging as log
+from loadconfig.lib import write_file
+import logging
 import os
 from os.path import exists
-from sphinx import build_main
 from sphinxserve.lib import fs_event_ctx, Webserver
 import sys
 from textwrap import dedent
+
+
+logger = logging.getLogger(__name__)
 
 
 conf = '''\
@@ -48,6 +52,9 @@ conf = '''\
                         short: d
                         action: store_true
                         default: __SUPPRESS__
+                    loglevel:
+                        short: l
+                        default: ERROR
                     uid:
                         short: u
                         type: int
@@ -112,6 +119,11 @@ class SphinxServer(object):
             port,
             self.render_ev
         )
+        logger.info(
+            "Listening on http://%s:%s",
+            host,
+            port,
+        )
         server.run()
 
     def watch(self):
@@ -119,7 +131,11 @@ class SphinxServer(object):
         '''
         with fs_event_ctx(self.c.sphinx_path, self.c.extensions) as fs_ev_iter:
             for event in fs_ev_iter:
-                log.debug('filesystem event: {}'.format(event, event.ev_name))
+                logger.info(
+                    '%s %s',
+                    event,
+                    event.ev_name,
+                )
                 self.watch_ev.set()
 
     def render(self):
@@ -128,26 +144,49 @@ class SphinxServer(object):
         while True:
             self.watch_ev.wait()  # Wait for docs changes
             self.watch_ev.clear()
-            with capture_stream() as stdout:
-                self.build()
-            log.debug(stdout.getvalue())
+
+            with tempfile.TemporaryFile() as stderr,\
+                    tempfile.TemporaryFile() as stdout:
+                self.build(stdout=stdout, stderr=stderr)
+
+                stdout.seek(0)
+                stderr.seek(0)
+
+                logger.debug(stdout.read())
+                logger.debug(stderr.read())
+
             self.render_ev.set()
 
-    def build(self):
-        return build_main([
-            'sphinx-build',
-            self.c.sphinx_path,
-            os.path.join(self.c.sphinx_path, self.c.output)
-        ])
+    def build(self, stdout=None, stderr=None):
+        with open(os.devnull, 'w') as fnull:
+            kwargs = {
+                'stdout': stdout or fnull,
+                'stderr': stderr or fnull,
+            }
+
+            result = subprocess.call(
+                [
+                    self.c.sphinx_bin_path,
+                    self.c.sphinx_path,
+                    os.path.join(self.c.sphinx_path, self.c.output)
+                ],
+                **kwargs
+            )
+            logger.info('Build completed')
+            return result
 
     def manage(self):
         '''Manage web server, watcher and sphinx docs renderer
         '''
-        with capture_stream() as stdout, capture_stream('stderr') as stderr:
-            ret = self.build()
-        if ret != 0:
-            sys.exit(stderr.getvalue())
-        log.debug(stdout.getvalue())
+        with tempfile.TemporaryFile() as stderr,\
+                tempfile.TemporaryFile() as stdout:
+            ret = self.build(stdout=stdout, stderr=stderr)
+
+            stdout.seek(0)
+            stderr.seek(0)
+            if ret != 0:
+                sys.exit(stderr.read())
+            logger.debug(stdout.read())
         workers = [spawn(self.serve), spawn(self.watch), spawn(self.render)]
         joinall(workers)
 
@@ -161,6 +200,18 @@ class Prog(object):
     def check_dependencies(self):
         '''Create sphinx conf.py and index.rst if necessary'''
         path = self.c.sphinx_path
+
+        sphinx_bin_path = subprocess.check_output([
+            'which',
+            'sphinx-build',
+        ]).strip()
+        if not sphinx_bin_path:
+            raise SystemError(
+                "`sphinx-build` not found; Is the sphinx python "
+                "package installed?"
+            )
+        self.c.sphinx_bin_path = sphinx_bin_path
+
         if not exists(path):
             os.makedirs(path)
         if not exists(path + '/index.rst'):
@@ -208,8 +259,17 @@ class Prog(object):
 
 def main(args):
     c = Config(conf, args=args, version=__version__)
+
     if c.debug:
-        log.root.setLevel(log.DEBUG)
+        logging.root.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.getLevelName(c.loglevel))
+        logging_stream = logging.StreamHandler()
+        logging_stream.setFormatter(
+            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        )
+        logger.addHandler(logging_stream)
+
     # Run command selected from cli (corresponding to conf subparser, and
     # Prog method. Eg: serve)
     c.run(Prog)
